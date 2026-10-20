@@ -357,7 +357,7 @@ module Reimbursement
     end
 
     def missing_categories?
-      expenses.where.not(type: Reimbursement::Expense::Fee.name).where(category: nil).exists?
+      expenses.where(category: nil).where("reimbursement_expenses.type IS DISTINCT FROM ?", Reimbursement::Expense::Fee.name).exists?
     end
 
     def mismatched_currency?
