@@ -180,7 +180,7 @@ class CardGrant
       PROMPT
 
       response = conn.post("/v1/responses", {
-                             model: "gpt-4.1",
+                             model: "gpt-6-luna",
                              input: [
                                {
                                  role: "system",
