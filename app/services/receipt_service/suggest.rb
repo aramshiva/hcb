@@ -9,13 +9,20 @@ module ReceiptService
       @receipt = receipt
     end
 
+    MAX_CANDIDATES = 25
+
+    TIE_BREAK_MARGIN = 10
+
     def run!(include_details: false)
       return nil if user.nil?
-      return nil unless @receipt.has_textual_content?
 
-      @extracted = ::ReceiptService::Extract.new(receipt: @receipt).run!
+      @text = @receipt.textual_content || @receipt.extract_textual_content![:text]
 
-      pairings = transaction_distances(include_details:)
+      extract = ::ReceiptService::Extract.new(receipt: @receipt, candidates: @receipt.receiptable.nil? ? candidates : [])
+      @extracted = extract.run!
+
+      best_match_hcb_code_id = extract.best_match_hcb_code_id || (quick_match&.id if @receipt.receiptable.nil?)
+      pairings = break_tie(transaction_distances(include_details:), best_match_hcb_code_id)
 
       if pairings.present?
         pairs = pairings.map do |pairing|
@@ -33,13 +40,7 @@ module ReceiptService
           content = turbo_stream_action_tag(:refresh_suggested_pairings)
           Turbo::StreamsChannel.broadcast_action_to([@receipt.user, :receipt_bin], action: :refresh_suggested_pairings)
 
-          if @receipt.email_receipt_bin? && pair = @receipt.suggested_pairings
-                                                           .unreviewed
-                                                           .where("distance <= ?", 20)
-                                                           .order(:receipt_id, distance: :asc)
-                                                           .select("DISTINCT ON (receipt_id) suggested_pairings.*")
-                                                           .select { |pairing| pairing.hcb_code.missing_receipt? }
-                                                           .first
+          if @receipt.email_receipt_bin? && (pair = auto_accept_pairing(extract))
             pair.mark_accepted!
 
             return pair
@@ -129,6 +130,77 @@ module ReceiptService
 
     private
 
+    def auto_accept_pairing(extract)
+      closest = @receipt.suggested_pairings
+                        .unreviewed
+                        .where("distance <= ?", 20)
+                        .order(:receipt_id, distance: :asc)
+                        .select("DISTINCT ON (receipt_id) suggested_pairings.*")
+                        .select { |pairing| pairing.hcb_code.missing_receipt? }
+                        .first
+
+      closest || sole_candidate_pairing(extract)
+    end
+
+    def sole_candidate_pairing(extract)
+      return unless potential_hcb_codes.one? && @extracted&.extracted_total_amount_cents
+      return unless extract.match_confidence.in?(%w[high medium])
+
+      hcb_code = potential_hcb_codes.sole
+      return unless extract.best_match_hcb_code_id == hcb_code.id && hcb_code.missing_receipt?
+
+      merchant_amount = hcb_code.stripe_merchant_amount
+      total = @extracted.extracted_total_amount_cents.abs
+      amount_matches = total == hcb_code.amount_cents.abs ||
+                       (merchant_amount.present? && @extracted.extracted_currency == merchant_amount.currency.iso_code && total == merchant_amount.cents)
+      return unless amount_matches
+
+      @receipt.suggested_pairings.unreviewed.find_by(hcb_code:)
+    end
+
+    def quick_match
+      return if @text.blank?
+
+      amounts = @text.scan(/(?<![\d.,])\d+(?:[,.]\d{3})*[.,]\d{2}(?![\d.,])/).map { |amount| amount.gsub(/\D/, "").to_i }.to_set
+      return if amounts.empty?
+
+      normalized_text = @text.downcase
+
+      matches = potential_hcb_codes.select do |hcb_code|
+        hcb_code_amounts = [hcb_code.amount_cents.abs, hcb_code.stripe_merchant_amount&.cents].compact
+        next false unless hcb_code_amounts.any? { |amount| amount.in?(amounts) }
+
+        last4 = hcb_code.card&.last4
+        merchant_word = hcb_code.stripe_merchant&.dig("name")&.downcase&.scan(/[a-z]{4,}/)&.first
+
+        (last4.present? && normalized_text.match?(/\b#{last4}\b/)) ||
+          (merchant_word.present? && normalized_text.include?(merchant_word))
+      end
+
+      matches.sole if matches.one?
+    end
+
+    def break_tie(pairings, best_match_hcb_code_id)
+      best_distance = pairings.filter_map { |pairing| pairing[:distance] }.min
+      pick = pairings.find { |pairing| pairing[:hcb_code].id == best_match_hcb_code_id }
+      return pairings if best_distance.nil? || pick.nil? || pick[:distance].nil?
+      return pairings if pick[:distance] > best_distance + TIE_BREAK_MARGIN
+
+      pairings.map do |pairing|
+        next pairing if pairing.equal?(pick) || pairing[:distance].nil? || pairing[:distance] > best_distance + TIE_BREAK_MARGIN
+
+        pairing.merge(distance: pairing[:distance] + TIE_BREAK_MARGIN)
+      end
+    end
+
+    def candidates
+      potential_hcb_codes.sort_by.with_index do |hcb_code, index|
+        amount = hcb_code.amount_cents.abs
+        formatted = format("%d.%02d", amount / 100, amount % 100)
+        [@text.to_s.include?(formatted) ? 0 : 1, index]
+      end.first(MAX_CANDIDATES)
+    end
+
     def transaction_distances(include_details: false)
       potential_hcb_codes.map do |hcb_code|
         {
@@ -143,7 +215,7 @@ module ReceiptService
     end
 
     def potential_hcb_codes
-      user.transactions_missing_receipt
+      @potential_hcb_codes ||= user.transactions_missing_receipt.to_a
     end
 
   end
